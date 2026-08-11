@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible defect without attaching private macro files or sensitive logs.
+title: "[Bug]: "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: 1.0.0+257fde44
+    validations:
+      required: true
+  - type: dropdown
+    id: flavor
+    attributes:
+      label: ZIP flavor
+      options:
+        - framework-dependent
+        - self-contained
+        - source build
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows build
+      placeholder: Windows 11 build number
+    validations:
+      required: true
+  - type: dropdown
+    id: integrity
+    attributes:
+      label: Integrity mode
+      options:
+        - ordinary
+        - elevated
+    validations:
+      required: true
+  - type: dropdown
+    id: capture
+    attributes:
+      label: Capture mode
+      options:
+        - Standard
+        - Raw Enhanced
+        - Not applicable
+    validations:
+      required: true
+  - type: dropdown
+    id: replay
+    attributes:
+      label: Mouse replay
+      options:
+        - AbsoluteDesktop (fixed)
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Reproduction and result
+      description: Do not attach .macro files, captured input, credentials, sensitive logs, screenshots with private data, or personal paths.
+    validations:
+      required: true

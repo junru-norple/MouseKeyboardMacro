@@ -1,0 +1,250 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-audit:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PUBLIC_SOLUTION: ${{ github.workspace }}\MouseKeyboardMacro.sln
+      PUBLIC_TEST_PROJECT: ${{ github.workspace }}\tests\MacroCore.Tests\MacroCore.Tests.csproj
+      DOTNET_CLI_HOME: ${{ github.workspace }}\.dotnet-cli-home
+      NUGET_PACKAGES: ${{ github.workspace }}\.nuget-packages
+      NUGET_HTTP_CACHE_PATH: ${{ github.workspace }}\.nuget-http-cache
+      TEMP: ${{ github.workspace }}\temp
+      TMP: ${{ github.workspace }}\temp
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+      DOTNET_NOLOGO: '1'
+      MKM_SAFE_VALIDATION_MODE: '1'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '8.0.423'
+
+      - name: Restore, build, and run every public test
+        shell: pwsh
+        run: >-
+          ./scripts/Test.ps1
+          -SolutionPath $env:PUBLIC_SOLUTION
+          -TestProjectPath $env:PUBLIC_TEST_PROJECT
+
+      - name: Run the actual Player UI layout probe fail closed
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $playerCandidates = @(
+            Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'src\MacroPlayer\bin') -Filter 'MacroPlayer.dll' -File -Recurse |
+              Where-Object { $_.FullName -notmatch '[\\/]ref[\\/]' }
+          )
+          if ($playerCandidates.Count -ne 1) {
+            $playerCandidates.FullName
+            throw "Expected exactly one built MacroPlayer.dll; found $($playerCandidates.Count)."
+          }
+
+          $probeRoot = Join-Path $env:GITHUB_WORKSPACE 'TestSandbox\ci-player-ui-probe'
+          if (Test-Path -LiteralPath $probeRoot) {
+            Remove-Item -LiteralPath $probeRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path (Join-Path $probeRoot 'Program\State\Logs') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $probeRoot 'Program\State\Settings') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $probeRoot 'Recordings') -Force | Out-Null
+          [IO.File]::WriteAllText(
+            (Join-Path $probeRoot 'Program\project-root.marker'),
+            "MOUSE_KEYBOARD_MACRO_ROOT_V2`r`n",
+            [Text.Encoding]::ASCII)
+
+          # The probe is runtime-disabled UI inspection. Clearing this variable is
+          # required because safe-smoke mode exits before the UI probe is reached.
+          $env:MKM_SAFE_VALIDATION_MODE = $null
+          $env:MKM_PROJECT_ROOT = $null
+          & dotnet $playerCandidates[0].FullName --ui-layout-probe --project-root $probeRoot
+          $probeExitCode = $LASTEXITCODE
+          $probeJson = Join-Path $probeRoot 'Program\State\Logs\ui_player_library.json'
+          if (-not (Test-Path -LiteralPath $probeJson -PathType Leaf)) {
+            throw "Player UI probe evidence is missing (exit=$probeExitCode)."
+          }
+          $probeEvidence = Get-Content -LiteralPath $probeJson -Raw | ConvertFrom-Json
+          $probeFindings = @($probeEvidence.failures)
+          Write-Output "PLAYER_UI_PROBE_EXIT_CODE=$probeExitCode"
+          Write-Output "PLAYER_UI_PROBE_FINDINGS=$($probeFindings.Count)"
+          if ($probeExitCode -ne 0) {
+            $probeFindings
+            throw "Player UI probe returned exit code $probeExitCode."
+          }
+          if ($probeEvidence.status -ne 'PASS') {
+            throw "Player UI probe JSON status is '$($probeEvidence.status)'."
+          }
+          if ($probeFindings.Count -ne 0) {
+            $probeFindings
+            throw "Player UI probe reported $($probeFindings.Count) finding(s)."
+          }
+          Write-Output 'PLAYER_UI_PROBE=PASS'
+
+      - name: Audit direct and transitive packages
+        shell: pwsh
+        run: |
+          $lines = & dotnet list $env:PUBLIC_SOLUTION package --vulnerable --include-transitive --format json 2>&1
+          $auditExitCode = $LASTEXITCODE
+          $audit = $lines | Out-String
+          $audit
+          if ($auditExitCode -ne 0) {
+            throw "NuGet vulnerability audit failed with exit code $auditExitCode."
+          }
+          if ($audit -match '(?i)"severity"\s*:\s*"(high|critical)"') {
+            throw 'High or critical NuGet vulnerability detected.'
+          }
+
+      - name: Verify canonical MIT license, repository manifest, and Markdown links
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $repoPrefix = $repo + '\'
+
+          $licensePath = Join-Path $repo 'LICENSE'
+          if (-not (Test-Path -LiteralPath $licensePath -PathType Leaf)) {
+            throw 'Canonical root LICENSE is missing.'
+          }
+          $licenseHash = (Get-FileHash -LiteralPath $licensePath -Algorithm SHA256).Hash
+          if ($licenseHash -ne '007F4954B08C74FB03505BD591239C614EA48B7F714CCDD8F32D5D7A7E2B57EC') {
+            throw "Canonical MIT LICENSE hash mismatch: $licenseHash"
+          }
+          $licenseText = [IO.File]::ReadAllText($licensePath, [Text.Encoding]::UTF8)
+          foreach ($marker in @('MIT License', 'Copyright (c) 2026 ru', 'THE SOFTWARE IS PROVIDED "AS IS"')) {
+            if (-not $licenseText.Contains($marker, [StringComparison]::Ordinal)) {
+              throw "Canonical LICENSE marker missing: $marker"
+            }
+          }
+          $licenseDocumentText = [IO.File]::ReadAllText((Join-Path $repo 'LICENSE_STATUS.md'), [Text.Encoding]::UTF8)
+          foreach ($marker in @('LICENSE_INCLUDED', 'SPDX_IDENTIFIER=MIT', 'Copyright (c) 2026 ru')) {
+            if (-not $licenseDocumentText.Contains($marker, [StringComparison]::Ordinal)) {
+              throw "LICENSE_STATUS.md marker missing: $marker"
+            }
+          }
+          Write-Output "LICENSE_INCLUDED=PASS|SPDX_IDENTIFIER=MIT|SHA256=$licenseHash"
+
+          $manifestPath = Join-Path $repo 'REPOSITORY_MANIFEST_SHA256.txt'
+          $companionPath = Join-Path $repo 'REPOSITORY_MANIFEST_SHA256.sha256'
+          foreach ($required in @($manifestPath, $companionPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Repository manifest file is missing: $required"
+            }
+          }
+          $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+          $companion = [IO.File]::ReadAllText($companionPath, [Text.Encoding]::UTF8).Trim()
+          if ($companion -ne "$manifestHash  REPOSITORY_MANIFEST_SHA256.txt") {
+            throw 'Repository manifest companion hash mismatch.'
+          }
+
+          $manifestEntries = [ordered]@{}
+          $manifestMarkers = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+          foreach ($line in [IO.File]::ReadAllLines($manifestPath, [Text.Encoding]::UTF8)) {
+            if ($line.StartsWith('# ', [StringComparison]::Ordinal)) {
+              if (-not $manifestMarkers.Add($line.Substring(2))) {
+                throw "Duplicate repository manifest marker: $line"
+              }
+              continue
+            }
+            if ($line -notmatch '^(?<hash>[0-9A-Fa-f]{64})  (?<path>.+)$') {
+              throw "Malformed repository manifest line: $line"
+            }
+            $expectedHash = $matches.hash.ToUpperInvariant()
+            $relative = $matches.path.Replace('\', '/')
+            if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|/)\.\.?(/|$)' -or $manifestEntries.Contains($relative)) {
+              throw "Unsafe or duplicate repository manifest path: $relative"
+            }
+            $resolved = [IO.Path]::GetFullPath((Join-Path $repo $relative.Replace('/', '\')))
+            if (-not $resolved.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+              throw "Repository manifest path is missing or outside the repository: $relative"
+            }
+            $actualHash = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
+            if ($actualHash -ne $expectedHash) {
+              throw "Repository manifest hash mismatch: $relative"
+            }
+            $manifestEntries[$relative] = $actualHash
+          }
+          foreach ($marker in @('LICENSE_INCLUDED', 'SPDX_IDENTIFIER=MIT', 'Copyright (c) 2026 ru')) {
+            if (-not $manifestMarkers.Contains($marker)) {
+              throw "Repository manifest marker missing: $marker"
+            }
+          }
+
+          $tracked = @(& git -c core.quotepath=false -C $repo ls-files)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate tracked repository files.' }
+          $expectedManifestPaths = @(
+            $tracked | Where-Object { $_ -notin @('REPOSITORY_MANIFEST_SHA256.txt', 'REPOSITORY_MANIFEST_SHA256.sha256') }
+          )
+          if ($manifestEntries.Count -ne $expectedManifestPaths.Count) {
+            throw "Repository manifest count mismatch: manifest=$($manifestEntries.Count) tracked=$($expectedManifestPaths.Count)"
+          }
+          foreach ($relative in $expectedManifestPaths) {
+            if (-not $manifestEntries.Contains($relative)) {
+              throw "Tracked file omitted from repository manifest: $relative"
+            }
+          }
+          if (-not $manifestEntries.Contains('LICENSE')) {
+            throw 'Canonical LICENSE is omitted from the repository manifest.'
+          }
+          Write-Output "REPOSITORY_MANIFEST=PASS|FILES=$($manifestEntries.Count)|SHA256=$manifestHash"
+
+          $linkCount = 0
+          foreach ($relative in @($tracked | Where-Object { $_.EndsWith('.md', [StringComparison]::OrdinalIgnoreCase) })) {
+            $markdownPath = Join-Path $repo $relative.Replace('/', '\')
+            $markdown = [IO.File]::ReadAllText($markdownPath, [Text.Encoding]::UTF8)
+            foreach ($match in [regex]::Matches($markdown, '!?(?<!\\)\[[^\]]*\]\(([^)]+)\)')) {
+              $target = $match.Groups[1].Value.Trim().Trim('<', '>')
+              if ($target -match '^(?i)(https?://|mailto:|#)') { continue }
+              $target = ($target -split '#')[0]
+              if ([string]::IsNullOrWhiteSpace($target)) { continue }
+              $decoded = [Uri]::UnescapeDataString($target).Replace('/', '\')
+              $resolved = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $markdownPath) $decoded))
+              if (-not $resolved.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                  -not (Test-Path -LiteralPath $resolved)) {
+                throw "Broken or escaping Markdown link in ${relative}: $target"
+              }
+              $linkCount++
+            }
+          }
+          Write-Output "MARKDOWN_LOCAL_LINKS=PASS|CHECKED=$linkCount"
+
+      - name: Publish and statically verify both portable flavors
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/Publish-Release.ps1
+          & ./scripts/Publish-Release.ps1 -SelfContained
+
+          $frameworkRoot = Join-Path $env:GITHUB_WORKSPACE 'artifacts\release\MouseKeyboardMacro-v1.0.0-framework-dependent'
+          $selfContainedRoot = Join-Path $env:GITHUB_WORKSPACE 'artifacts\release\MouseKeyboardMacro-v1.0.0-self-contained'
+          & ./scripts/Verify-Release.ps1 `
+            -ReleaseRoot $frameworkRoot `
+            -ExpectedFlavor 'framework-dependent' `
+            -ReportPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts\ci-verify-framework.txt')
+          & ./scripts/Verify-Release.ps1 `
+            -ReleaseRoot $selfContainedRoot `
+            -ExpectedFlavor 'self-contained' `
+            -ReportPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts\ci-verify-self-contained.txt')
+          Write-Output 'RELEASE_VERIFIER_NO_EXEC=PASS|FLAVORS=2|LIVE_INPUT=NO'
+
+      - name: Confirm CI did not modify tracked files
+        shell: pwsh
+        run: |
+          $changes = @(git status --porcelain=v1 --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect the Git working tree.' }
+          if ($changes.Count -ne 0) {
+            $changes
+            throw 'Build or tests modified the public repository tree.'
+          }
