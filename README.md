@@ -1,4 +1,4 @@
-牛逼# MouseKeyboardMacro
+# MouseKeyboardMacro
 
 MouseKeyboardMacro 是 Windows 11 x64 的本機滑鼠與鍵盤錄製／重播工具。它只處理使用者明確選擇的本機巨集，不提供遠端控制、驅動程式注入或權限繞過。
 
